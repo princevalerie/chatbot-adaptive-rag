@@ -22,10 +22,11 @@ import re
 
 from langgraph.graph import StateGraph, END
 from langgraph.prebuilt import ToolNode
+from pydantic import BaseModel, Field
 
 # Streamlit Configuration
 st.set_page_config(
-    page_title="AI Assistant with Agentic RAG Capabilities",
+    page_title="AI Assistant with Adaptive RAG Capabilities",
     page_icon="🧠",
     layout="wide"
 )
@@ -89,7 +90,7 @@ if not env_api_key or st.session_state.override_api_key:
 
 # Final validation
 if not api_key:
-    st.title("🧠 AI Assistant with Agentic RAG Capabilities")
+    st.title("🧠 AI Assistant with Adaptive RAG Capabilities")
     st.info("👈 Please provide a valid Google API Key in the sidebar to get started.")
     st.stop()
 
@@ -120,42 +121,55 @@ def initialize_models(_api_key):
 model, embeddings = initialize_models(api_key)
 
 if not model:
-    st.title("🧠 AI Assistant with Agentic RAG Capabilities")
+    st.title("🧠 AI Assistant with Adaptive RAG Capabilities")
     st.error("Failed to initialize AI models. Please check your API key.")
     st.stop()
 
 # STATE DEFINITION
-class AdaptiveRetrievalState(TypedDict):
+class AdaptiveRetrievalState(BaseModel):
     # Core data
     original_query: str
     current_query: str
-    query_history: List[str]
-    
+    query_history: List[str] = Field(default_factory=list)
+
     # Reasoning outputs
-    reasoning_analysis: str
-    query_intent: str
-    domain_context: str
-    
+    reasoning_analysis: str = ""
+    query_intent: str = ""
+
     # Retrieval results
-    retrieved_docs: List[Dict]
-    doc_scores: List[float]
-    best_docs: List[Dict]
-    best_confidence: float
-    
+    retrieved_docs: List[Dict] = Field(default_factory=list)
+    doc_scores: List[float] = Field(default_factory=list)
+    best_docs: List[Dict] = Field(default_factory=list)
+    best_confidence: float = 0.0
+
     # Quality metrics
-    confidence_score: float
-    confidence_level: str
-    quality_reasons: List[str]
-    
+    confidence_score: float = 0.0
+    confidence_level: str = ""
+    quality_reasons: List[str] = Field(default_factory=list)
+
     # Flow control
-    iteration_count: int
-    max_iterations: int
-    should_continue: bool
-    
+    iteration_count: int = 0
+    max_iterations: int = 5
+    should_continue: bool = True
+
     # Final output
-    final_answer: str
-    answer_source: str
-    metadata: Dict[str, Any]
+    final_answer: str = ""
+    answer_source: str = ""
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+
+    # Dict-like helpers for compatibility with existing code
+    def __getitem__(self, key):
+        return getattr(self, key)
+
+    def __setitem__(self, key, value):
+        setattr(self, key, value)
+
+    def update(self, data: Dict[str, Any]):
+        for k, v in data.items():
+            setattr(self, k, v)
+
+    def get(self, key: str, default=None):
+        return getattr(self, key, default)
 
 # CONFIDENCE CALCULATION FUNCTIONS
 def calculate_keyword_coverage(query: str, docs: List[Dict]) -> float:
@@ -273,13 +287,11 @@ CRITICAL RULES:
 
 Please analyze:
 1. INTENT: What type of information is the user seeking? (based only on query words)
-2. DOMAIN: What domain does this belong to? (only if clearly indicated in query)
-3. COMPLEXITY: How complex is this query? (simple/moderate/complex)
-4. STRATEGY: What search approach would work best? (based on query structure)
+2. COMPLEXITY: How complex is this query? (simple/moderate/complex)
+3. STRATEGY: What search approach would work best? (based on query structure)
 
 Provide your analysis in this format:
 INTENT: [analysis based only on query text]
-DOMAIN: [domain only if explicitly mentioned in query, otherwise 'general']
 COMPLEXITY: [complexity level based on query structure]
 STRATEGY: [approach based on query characteristics]
 """
@@ -290,13 +302,11 @@ STRATEGY: [approach based on query characteristics]
         
         # Parse the response
         lines = reasoning_text.split('\n')
-        intent = domain = complexity = strategy = ""
+        intent = complexity = strategy = ""
         
         for line in lines:
             if line.startswith("INTENT:"):
                 intent = line.replace("INTENT:", "").strip()
-            elif line.startswith("DOMAIN:"):
-                domain = line.replace("DOMAIN:", "").strip()
             elif line.startswith("COMPLEXITY:"):
                 complexity = line.replace("COMPLEXITY:", "").strip()
             elif line.startswith("STRATEGY:"):
@@ -306,11 +316,10 @@ STRATEGY: [approach based on query characteristics]
         state.update({
             "reasoning_analysis": reasoning_text,
             "query_intent": intent,
-            "domain_context": domain,
             "current_query": original_query,
             "query_history": [original_query],
             "iteration_count": 0,
-            "max_iterations": 3,
+            "max_iterations": 5,
             "should_continue": True,
             "best_confidence": 0.0,
             "metadata": {
@@ -324,11 +333,10 @@ STRATEGY: [approach based on query characteristics]
         state.update({
             "reasoning_analysis": f"Error in reasoning: {str(e)}",
             "query_intent": "general",
-            "domain_context": "general",
             "current_query": original_query,
             "query_history": [original_query],
             "iteration_count": 0,
-            "max_iterations": 3,
+            "max_iterations": 5,
             "should_continue": True,
             "best_confidence": 0.0,
             "metadata": {}
@@ -339,7 +347,7 @@ STRATEGY: [approach based on query characteristics]
 def retriever_node(state: AdaptiveRetrievalState) -> AdaptiveRetrievalState:
     """
     Node 2: Retriever - Performs document retrieval and confidence calculation
-    Can be executed MULTIPLE times (up to 3 iterations)
+    Can be executed MULTIPLE times (up to 5 iterations)
     """
     current_query = state["current_query"]
     iteration = state["iteration_count"] + 1
@@ -358,16 +366,17 @@ def retriever_node(state: AdaptiveRetrievalState) -> AdaptiveRetrievalState:
         confidence_score = calculate_confidence_score(
             docs=retrieved_docs,
             scores=doc_scores,
-            query=current_query,
-            domain=state.get("domain_context", "")
+            query=current_query
         )
         
-        # Determine confidence level based on thresholds
-        if iteration == 1 and confidence_score >= 0.8:
+        # Determine confidence level using composite signals (score, strong docs, coverage)
+        strong_docs = len([s for s in doc_scores if s >= 0.6])
+        keyword_coverage = calculate_keyword_coverage(current_query, retrieved_docs)
+        if confidence_score >= 0.80 and strong_docs >= 2:
             confidence_level = "high"
-        elif iteration == 2 and confidence_score >= 0.7:
+        elif confidence_score >= 0.65 and keyword_coverage >= 0.50:
             confidence_level = "medium"
-        elif iteration >= 3:
+        elif confidence_score >= 0.50:
             confidence_level = "low"
         else:
             confidence_level = "insufficient"
@@ -527,7 +536,7 @@ def should_continue_retrieval(state: AdaptiveRetrievalState) -> str:
     """
     confidence = state.get("confidence_score", 0.0)
     iteration = state.get("iteration_count", 0)
-    max_iterations = state.get("max_iterations", 3)
+    max_iterations = state.get("max_iterations", 5)
     
     # High confidence on first try (0.9 threshold) - STOP
     if iteration == 1 and confidence >= 0.9:
@@ -829,7 +838,7 @@ if not uploaded_files and st.session_state.documents_processed:
     st.rerun()
 
 # MAIN CONTENT AREA
-st.title("🧠 AI Assistant with Agentic RAG Capabilities")
+st.title("🧠 AI Assistant with Adaptive RAG Capabilities")
 
 # Only show chat interface if documents are processed
 if st.session_state.documents_processed and st.session_state.vector_store:
@@ -851,28 +860,27 @@ if st.session_state.documents_processed and st.session_state.vector_store:
         with st.chat_message("assistant"):
             with st.spinner("🧠 Analyzing with adaptive retrieval..."):
                 try:
-                    # Initialize state for the graph
-                    initial_state = {
-                        "original_query": question,
-                        "current_query": "",
-                        "query_history": [],
-                        "reasoning_analysis": "",
-                        "query_intent": "",
-                        "domain_context": "",
-                        "retrieved_docs": [],
-                        "doc_scores": [],
-                        "best_docs": [],
-                        "best_confidence": 0.0,
-                        "confidence_score": 0.0,
-                        "confidence_level": "",
-                        "quality_reasons": [],
-                        "iteration_count": 0,
-                        "max_iterations": 3,
-                        "should_continue": True,
-                        "final_answer": "",
-                        "answer_source": "",
-                        "metadata": {}
-                    }
+                    # Initialize state for the graph (BaseModel)
+                    initial_state = AdaptiveRetrievalState(
+                        original_query=question,
+                        current_query="",
+                        query_history=[],
+                        reasoning_analysis="",
+                        query_intent="",
+                        retrieved_docs=[],
+                        doc_scores=[],
+                        best_docs=[],
+                        best_confidence=0.0,
+                        confidence_score=0.0,
+                        confidence_level="",
+                        quality_reasons=[],
+                        iteration_count=0,
+                        max_iterations=5,
+                        should_continue=True,
+                        final_answer="",
+                        answer_source="",
+                        metadata={}
+                    )
                     
                     # Execute the graph
                     result = adaptive_graph.invoke(initial_state)
@@ -901,7 +909,7 @@ else:
     if not uploaded_files:
         st.markdown("""
         <div style="text-align: center; padding: 50px;">
-            <h3>🧠 AI Assistant with Agentic RAG Capabilities</h3>
+            <h3>🧠 AI Assistant with Adaptive RAG Capabilities</h3>
             <p>👈 Upload your PDF documents in the sidebar to get started</p>
             <p>Experience intelligent document analysis with autonomous reasoning, adaptive retrieval, and smart query enhancement.</p>
         </div>
