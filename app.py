@@ -6,13 +6,13 @@ from typing import TypedDict, Annotated, List, Dict, Any
 from langchain_core.prompts import ChatPromptTemplate, PromptTemplate
 from langchain_core.vectorstores import InMemoryVectorStore
 from langchain_core.tools import tool
-from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
+from groq import Groq
 from langchain_community.vectorstores import FAISS
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_pymupdf4llm import PyMuPDF4LLMLoader
 from langchain_core.messages import HumanMessage, AIMessage, BaseMessage
 
-import google.generativeai as genai
+from langchain_huggingface import HuggingFaceEmbeddings
 from PIL import Image
 import io
 import base64
@@ -39,15 +39,15 @@ if 'override_api_key' not in st.session_state:
     st.session_state.override_api_key = False
 
 # Check for environment variable first
-env_api_key = os.environ.get("GOOGLE_API_KEY")
+env_api_key = os.environ.get("GROQ_API_KEY")
 api_key = None
 
 # Test environment API key if it exists
 def test_api_key(key):
-    """Test if API key works by trying to configure genai"""
+    """Test if API key works by trying to initialize Groq client"""
     try:
-        genai.configure(api_key=key)
-        # Try a simple test (this doesn't count against quota)
+        client = Groq(api_key=key)
+        # Try a simple test to verify the key works
         return True
     except Exception:
         return False
@@ -70,7 +70,7 @@ if env_api_key and not st.session_state.override_api_key:
 # Show manual input if no env key or override is enabled
 if not env_api_key or st.session_state.override_api_key:
     # Manual API Key Input
-    manual_api_key = st.sidebar.text_input("Enter Google API Key:", type="password")
+    manual_api_key = st.sidebar.text_input("Enter Groq API Key:", type="password")
     
     if st.session_state.override_api_key and env_api_key:
         # Show option to go back to env key
@@ -91,26 +91,76 @@ if not env_api_key or st.session_state.override_api_key:
 # Final validation
 if not api_key:
     st.title("🧠 AI Assistant with Adaptive RAG Capabilities")
-    st.info("👈 Please provide a valid Google API Key in the sidebar to get started.")
+    st.info("👈 Please provide a valid Groq API Key in the sidebar to get started.")
     st.stop()
 
-# Gemini Configuration
-os.environ["GOOGLE_API_KEY"] = api_key
-genai.configure(api_key=api_key)
+# Groq Configuration
+os.environ["GROQ_API_KEY"] = api_key
+
+# Model name configuration in sidebar
+st.sidebar.markdown("---")
+st.sidebar.markdown("### 🤖 Model Configuration")
+
+# Initialize session state for model name
+if 'model_name' not in st.session_state:
+    st.session_state.model_name = "moonshotai/kimi-k2-instruct-0905"
+
+# Model name input
+model_name = st.sidebar.text_input(
+    "Model Name:",
+    value=st.session_state.model_name,
+    help="Enter the Groq model name (e.g., moonshotai/kimi-k2-instruct-0905)"
+)
+
+if model_name != st.session_state.model_name:
+    st.session_state.model_name = model_name
+    st.rerun()
+
+# Groq wrapper class to make it compatible with LangChain message format
+class GroqWrapper:
+    """Wrapper to make Groq client compatible with LangChain invoke pattern"""
+    def __init__(self, api_key, model_name):
+        self.client = Groq(api_key=api_key)
+        self.model_name = model_name
+    
+    def invoke(self, messages):
+        """Convert LangChain messages to Groq format and call API"""
+        groq_messages = []
+        for msg in messages:
+            if hasattr(msg, 'content'):
+                role = "user" if msg.__class__.__name__ == "HumanMessage" else "assistant"
+                groq_messages.append({
+                    "role": role,
+                    "content": msg.content
+                })
+        
+        try:
+            completion = self.client.chat.completions.create(
+                model=self.model_name,
+                messages=groq_messages,
+                temperature=0.1
+            )
+            
+            # Create a simple response object with content attribute
+            class Response:
+                def __init__(self, content):
+                    self.content = content
+            
+            return Response(completion.choices[0].message.content)
+        except Exception as e:
+            raise Exception(f"Groq API error: {str(e)}")
 
 # Initialize models
 @st.cache_resource
-def initialize_models(_api_key):
+def initialize_models(_api_key, _model_name):
     try:
-        model = ChatGoogleGenerativeAI(
-            model="gemini-2.0-flash",
-            temperature=0.1,
-            google_api_key=_api_key
-        )
+        # Initialize Groq wrapper
+        model = GroqWrapper(api_key=_api_key, model_name=_model_name)
         
-        embeddings = GoogleGenerativeAIEmbeddings(
-            model="models/embedding-001",
-            google_api_key=_api_key
+        # Initialize HuggingFace embeddings (runs locally, no API key needed)
+        embeddings = HuggingFaceEmbeddings(
+            model_name="sentence-transformers/all-MiniLM-L6-v2",
+            model_kwargs={'device': 'cpu'}
         )
         
         return model, embeddings
@@ -118,12 +168,17 @@ def initialize_models(_api_key):
         st.sidebar.error(f"❌ Error initializing models: {str(e)}")
         return None, None
 
-model, embeddings = initialize_models(api_key)
+# Show loading spinner while initializing models
+with st.spinner("🔄 Memuat model embedding (lokal, pertama kali mungkin perlu download)..."):
+    model, embeddings = initialize_models(api_key, st.session_state.model_name)
 
 if not model:
     st.title("🧠 AI Assistant with Adaptive RAG Capabilities")
-    st.error("Failed to initialize AI models. Please check your API key.")
+    st.error("Failed to initialize AI models. Please check your API key and model name.")
     st.stop()
+else:
+    st.sidebar.success(f"✅ Model: `{st.session_state.model_name}`")
+    st.sidebar.success("✅ Embedding: `all-MiniLM-L6-v2` (lokal)")
 
 # STATE DEFINITION
 class AdaptiveRetrievalState(BaseModel):
@@ -764,10 +819,11 @@ else:
 st.sidebar.markdown("---")
 st.sidebar.markdown("### 📋 How to Use")
 st.sidebar.markdown("""
-1. ✅ Enter your Google API Key above
-2. 📄 Upload PDF files
-3. ⏳ Wait for processing to complete
-4. 💬 Ask questions about the data
+1. ✅ Enter your Groq API Key above
+2. 🤖 Configure model name (default: Kimi K2)
+3. 📄 Upload PDF files
+4. ⏳ Wait for processing to complete
+5. 💬 Ask questions about the data
 """)
 
 # SIDEBAR - PROCESSING SECTION
